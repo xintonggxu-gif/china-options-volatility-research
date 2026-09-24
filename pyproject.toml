@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cn-option-data"
+version = "0.4.0"
+description = "Registry-driven live quotes for Chinese ETF and index option chains"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "akshare>=1.18.97,<2",
+  "pyarrow>=20,<24",
+  "requests>=2.31,<3",
+]
+
+[project.scripts]
+cn-option-data = "cn_option_data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
