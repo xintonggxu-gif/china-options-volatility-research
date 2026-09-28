@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,16 @@ class LiveConfig:
     max_buffer_rows: int = 50_000
     refresh_interval_seconds: float = 1800.0
     heartbeat_interval_seconds: float = 60.0
+    request_timeout_seconds: float = 15.0
+    trading_hours_only: bool = False
+
+    @property
+    def calendar_path(self) -> Path:
+        return self.project_root / "config" / "trading_calendar.json"
+
+    @property
+    def log_path(self) -> Path:
+        return self.project_root / "logs" / "collect-live.log"
 
     @property
     def registry_path(self) -> Path:
@@ -34,14 +45,16 @@ def load_live_config(
     flush_interval_seconds: float = 30.0,
     max_buffer_rows: int = 50_000,
     project_root: Path | None = None,
+    trading_hours_only: bool = False,
 ) -> LiveConfig:
-    if interval_seconds <= 0:
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
         raise ValueError("interval-seconds 必须大于 0")
-    if flush_interval_seconds <= 0 or max_buffer_rows <= 0:
+    if not math.isfinite(flush_interval_seconds) or flush_interval_seconds <= 0 or max_buffer_rows <= 0:
         raise ValueError("缓冲阈值必须大于 0")
     return LiveConfig(
         project_root=(project_root or default_project_root()).resolve(),
         interval_seconds=interval_seconds,
         flush_interval_seconds=flush_interval_seconds,
         max_buffer_rows=max_buffer_rows,
+        trading_hours_only=trading_hours_only,
     )

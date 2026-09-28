@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,46 @@ def exchange_timestamp(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=SHANGHAI) if parsed.tzinfo is None else parsed.astimezone(SHANGHAI)
+
+
+def source_datetime(value: Any) -> datetime | None:
+    """Parse only a source-supplied date; never date a clock-only string locally."""
+    if value is None or str(value) in {"NaT", "nan", "None", ""}:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=SHANGHAI) if value.tzinfo is None else value.astimezone(SHANGHAI)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=SHANGHAI)
+    text = str(value).strip()
+    if re.match(r"^\d{8}(?:\s|$)", text):
+        text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if not re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", text):
+        return None
+    return exchange_timestamp(text.replace("/", "-"))
+
+
+def quote_clock(quote: dict[str, Any]) -> tuple[datetime | None, str, str | None]:
+    """Full timestamp, known source day, quality flag (no Parquet schema additions)."""
+    raw = quote.get("source_quote_time")
+    if raw is None or not str(raw).strip():
+        raw = quote.get("quote_timestamp")
+    parsed = source_datetime(raw)
+    if parsed is None:
+        # A missing/malformed clock must not erase a separately supplied valid date.
+        text = str(raw).strip() if raw is not None else ""
+        match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?=\s|T|$)", text)
+        if match:
+            try:
+                day = date(*(int(part) for part in match.groups())).isoformat()
+            except ValueError:
+                pass
+            else:
+                return None, day, "SOURCE_TIME_DATE_ONLY"
+        return None, "unknown", "SOURCE_TIME_UNKNOWN"
+    day = parsed.date().isoformat()
+    if parsed.hour == parsed.minute == parsed.second == parsed.microsecond == 0:
+        return None, day, "SOURCE_TIME_DATE_ONLY"
+    return parsed, day, None
 
 
 def finite_number(value: Any, *, positive: bool = False) -> float | None:

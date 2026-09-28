@@ -69,6 +69,10 @@ SCHEMAS = {
 }
 
 
+class StorageWriteError(RuntimeError):
+    """Fatal storage failure, never retry this as a provider/network failure."""
+
+
 class ParquetWriter:
     def __init__(self, data_dir: Path, *, max_buffer_rows: int = 50_000, flush_interval_seconds: float = 30.0):
         if max_buffer_rows <= 0 or flush_interval_seconds <= 0:
@@ -78,12 +82,17 @@ class ParquetWriter:
         self.flush_interval_seconds = flush_interval_seconds
         self.buffers: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.rows_written: dict[str, int] = defaultdict(int)
+        self.rows_accepted: dict[str, int] = defaultdict(int)
+        self.accepted_by_product: dict[tuple[str, str], int] = defaultdict(int)
+        self.written_by_product: dict[tuple[str, str], int] = defaultdict(int)
         self.last_flush = time.monotonic()
 
     def append(self, table: str, row: dict[str, Any]) -> None:
         if table not in SCHEMAS:
             raise ValueError(f"未知表: {table}")
         self.buffers[table].append(row)
+        self.rows_accepted[table] += 1
+        self.accepted_by_product[(table, row.get("product_id", row.get("mapped_option_product", "ALL")))] += 1
         if sum(map(len, self.buffers.values())) >= self.max_buffer_rows:
             self.flush()
 
@@ -100,6 +109,12 @@ class ParquetWriter:
         return row["trade_date"], row["exchange"], row["hour"]
 
     def flush(self) -> None:
+        try:
+            self._flush()
+        except Exception as exc:
+            raise StorageWriteError(f"Parquet 保存失败 ({type(exc).__name__})；未写入批次仍在缓冲") from exc
+
+    def _flush(self) -> None:
         for table in SCHEMAS:
             while self.buffers[table]:
                 key = self._partition(self.buffers[table][0])
@@ -119,9 +134,16 @@ class ParquetWriter:
                     temporary.unlink(missing_ok=True)
                     raise
                 self.rows_written[table] += len(batch)
+                for row in batch:
+                    product = row.get("product_id", row.get("mapped_option_product", "ALL"))
+                    self.written_by_product[(table, product)] += 1
                 self.buffers[table] = [row for row in self.buffers[table] if self._partition(row) != key]
                 LOG.info("wrote %s rows=%s path=%s", table, len(batch), target)
         self.last_flush = time.monotonic()
+
+    @property
+    def buffered_rows(self) -> int:
+        return sum(len(rows) for rows in self.buffers.values())
 
     @property
     def quote_rows_written(self) -> int:

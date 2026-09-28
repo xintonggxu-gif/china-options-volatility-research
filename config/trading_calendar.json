@@ -1,0 +1,29 @@
+{
+  "timezone": "Asia/Shanghai",
+  "valid_from": "2026-01-01",
+  "valid_to": "2026-12-31",
+  "verified_on": "2026-09-27",
+  "sources": {
+    "SSE": ["https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml", "https://www.sse.com.cn/disclosure/announcement/general/c/c_20260915_10832273.shtml"],
+    "SZSE": ["https://www.szse.cn/disclosure/notice/t20251222_618087.html", "https://investor.szse.cn/disclosure/notice/general/t20260917_622911.html"],
+    "CFFEX": ["https://www.cffex.com.cn/jystz/20251217/46425.html", "https://www.publicnow.com/view/B5D910EC76533E21DFC5DE4A69E67332A37FAA4F"]
+  },
+  "verification_note": "沪深官方年度公告及9月公告已核对；中金所原站本次请求超时，年度公告正文通过CFFEX发布内容的Public转载核对。临时休市变更须更新配置。",
+  "sampling_windows": [["09:30:00", "11:30:00"], ["13:00:00", "15:00:00"]],
+  "sampling_note": "共同日盘采样窗口，包含ETF收盘集合竞价，不含开盘集合竞价。周六周日均休市，包括调休工作日。",
+  "session_sources": [
+    "https://www.sse.com.cn/lawandrules/sselawsrules2025/option/c/c_20250610_10781448.shtml",
+    "https://docs.static.szse.cn/www/option/rules/optrules/W020191207434561721119.pdf",
+    "https://www.cffex.com.cn/cn/sz50gzqq.html",
+    "https://www.cffex.com.cn/cn/hs300.html"
+  ],
+  "closed_ranges": [
+    ["2026-01-01", "2026-01-03"],
+    ["2026-02-15", "2026-02-23"],
+    ["2026-04-04", "2026-04-06"],
+    ["2026-05-01", "2026-05-05"],
+    ["2026-06-19", "2026-06-21"],
+    ["2026-09-25", "2026-09-27"],
+    ["2026-10-01", "2026-10-07"]
+  ]
+}
