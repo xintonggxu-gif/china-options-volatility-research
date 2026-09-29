@@ -1,10 +1,10 @@
-# cn_option_data · 12 条期权产品链定时行情采集
+# cn_option_data: Scheduled Live Quotes for 12 Option Product Chains
 
-本项目只做当前合约发现和 HTTP 行情轮询。合约主表和部分行情使用 AKShare；沪深 ETF 期权及 ETF、指数标的行情直接批量读取新浪财经公开报价接口。产品范围和期货映射来自 `config/product_registry.csv`。
+This project discovers current option contracts and polls HTTP quote interfaces. It uses AKShare for contract masters and some quotes. SSE/SZSE ETF option quotes and ETF/index underlying quotes are requested directly from Sina Finance in batches. The selected products and their related futures come from `config/product_registry.csv`.
 
-## 安装
+## Installation
 
-建议 Python 3.11 或更高版本。在本目录执行：
+Python 3.11 or newer is recommended. From the project directory, run:
 
 ```bash
 python -m venv .venv
@@ -12,41 +12,41 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-这些公开接口不要求本程序配置账号。可用环境变量 `POLL_INTERVAL_SECONDS` 设置默认轮询秒数；命令行的 `--interval-seconds` 优先。`.env.example` 只展示该可选变量，程序不会自动读取 `.env` 文件。
+The public interfaces used by this program do not require account credentials. The optional `POLL_INTERVAL_SECONDS` environment variable sets the default polling interval; `--interval-seconds` takes precedence. `.env.example` documents the variable, but the program does not load `.env` automatically.
 
-## 启动和停止
+## Starting and Stopping
 
-采集注册表中的全部 12 个产品：
+Collect all 12 registered products:
 
 ```bash
 python -m cn_option_data.cli collect-live --products all --interval-seconds 60
 ```
 
-只采集 510050：
+Collect only 510050:
 
 ```bash
 python -m cn_option_data.cli collect-live --products 510050 --interval-seconds 60
 ```
 
-`interval-seconds` 是两次轮询开始之间的目标间隔。如果单轮请求耗时超过间隔，程序会告警，并在短暂休息后开始下一轮。按 `Ctrl+C` 停止，或向进程发送 `SIGTERM`。退出前会保存内存缓冲并写入一条 `ingestion_runs` 记录。默认每 30 秒或累积 50,000 行批量写入；可用 `--flush-interval-seconds` 与 `--max-buffer-rows` 调整。
+`--interval-seconds` is the target interval between the starts of polling cycles. If a cycle exceeds that interval, the program logs its actual duration and starts the next cycle after a short pause; cycles do not overlap. Press `Ctrl+C` or send `SIGTERM` to stop. The program flushes buffered data and writes an `ingestion_runs` record before exiting. By default, it writes in batches every 30 seconds or after buffering 50,000 rows. Use `--flush-interval-seconds` and `--max-buffer-rows` to adjust those thresholds.
 
-## 产品与接口
+## Products and Data Interfaces
 
-| 交易所 | 产品 | 合约发现 | 期权行情 |
+| Exchange | Option products | Contract discovery | Option quotes |
 | --- | --- | --- | --- |
-| SSE | 510050、510300、510500、588000、588080 | `option_current_day_sse` | 直接批量读取新浪 `CON_OP_<合约编码>`（与 AKShare `option_sse_spot_price_sina` 使用同一上游）；缺报价时尝试 `option_current_em`，该备用接口可能只有最新价 |
-| SZSE | 159919、159922、159915、159901 | `option_current_day_szse` | 新浪财经 `https://hq.sinajs.cn/list=CON_OP_<合约编码>`；批量读取买一、卖一、数量、最新价、成交量、成交额、持仓量、源时间 |
-| CFFEX | HO、IO、MO | 对应的 `option_cffex_*_list_sina` 动态月份列表，再从对应 `option_cffex_*_spot_sina` 盘口表取合约；用 OpenCTP 合约资料核对最后交易日 | 同一 `spot_sina` 表；成交量与成交额留空，因为该表不提供这些字段 |
+| SSE | 510050, 510300, 510500, 588000, 588080 | AKShare `option_current_day_sse` | Direct batched Sina `CON_OP_<contract ID>` requests, using the same upstream endpoint as AKShare `option_sse_spot_price_sina`. Missing quotes may trigger the `option_current_em` fallback, which may provide only a last price. |
+| SZSE | 159919, 159922, 159915, 159901 | AKShare `option_current_day_szse` | Direct batched `https://hq.sinajs.cn/list=CON_OP_<contract ID>` requests for best bid/ask prices and sizes, last price, volume, turnover, open interest, and a source time field. |
+| CFFEX | HO, IO, MO | The corresponding `option_cffex_*_list_sina` interfaces supply current months. The matching `option_cffex_*_spot_sina` tables supply contracts. OpenCTP contract data is used to cross-check last trading dates. | The same `spot_sina` tables provide BBO, sizes, last price, and open interest. They do not provide option volume or turnover. |
 
-SSE 与 SZSE 合约由当日主表的合约代码前六位、看涨/看跌标识和标的代码精确归属到注册表；行情按 `合约编码` 精确关联。CFFEX 合约由 `HO/IO/MO + 到期年月 + C/P + 行权价` 解析，月份从当日列表读取，不固定到代码中。
+SSE and SZSE contracts are assigned to registry products using the exact six-digit underlying code and call/put marker in the current trading code, with a check against the underlying identifier. Quotes are joined using the exact contract ID. CFFEX contract codes are parsed as `HO/IO/MO + expiry year/month + C/P + strike`. The months are read from the current lists, not hard-coded.
 
-中金所合约乘数 **100 元/点**、最小变动价位 **0.2 点**，依据[中金所股指期权合约交易细则](https://www.cffex.com.cn/cn/ssxz/20221214/43100.html)填写。最后交易日从 OpenCTP 合约资料接口（AKShare `option_contract_info_ctp` 使用的同一上游）读取，只在交易所、合约代码、年月、行权价等核对成功后填写；接口失败或无法核对时保留 null，并记录警告，不按“第三个星期五”推算。此补充请求随合约主表每 30 分钟刷新，设有超时，不影响期权行情采集。`expire_datetime` 与 `last_trading_date` 存储的是**日期**；Parquet 字段为时间类型，所以使用该日 `00:00:00` 表示日期，**不能当作精确到期时刻用于 IV/Greeks**。若稍后补齐了资料，同一天会追加一条更新后的合约快照，旧快照不会覆盖。
+The CFFEX option multiplier is **CNY 100 per index point** and its minimum price movement is **0.2 index points**, following the [CFFEX index option trading rules](https://www.cffex.com.cn/cn/ssxz/20221214/43100.html). Last trading dates come from the OpenCTP contract reference endpoint, which is also used by AKShare `option_contract_info_ctp`. A date is filled only after checking the exchange, contract ID, year/month, strike, and other terms. If the reference is unavailable or cannot be verified, the date stays null and a warning is logged; the program does not infer a “third Friday” date. This bounded request accompanies the 30-minute contract refresh and is not repeated every quote cycle. `expire_datetime` and `last_trading_date` store **dates**. Because the Parquet fields are timestamps, `00:00:00` represents that date; it **must not be treated as a verified expiry instant for IV or Greeks**. A later metadata supplement appends another same-day contract snapshot without overwriting the earlier one.
 
-ETF 标的和 HO/IO/MO 对应的指数从新浪财经 `https://hq.sinajs.cn/list=<sh或sz代码>` 批量读取。指数没有买卖一盘口，保持 null。IH/IF/IC/IM 期货仍通过 AKShare `futures_symbol_mark` 查找中金所品种名称，再调用 `futures_zh_realtime`。对冲关系逐行读取注册表：510050、HO→IH；510300、159919、IO→IF；510500、159922→IC；MO→IM。588000、588080、159915、159901 采集 ETF 现货，不配置对冲期货。
+ETF underlyings and the indexes associated with HO/IO/MO are requested from Sina Finance in batches at `https://hq.sinajs.cn/list=<sh or sz code>`. An index value has no tradable best bid/ask, so those fields remain null. AKShare `futures_symbol_mark` identifies the CFFEX futures product names, and `futures_zh_realtime` supplies their quotes. The registry defines the hedge relationships: 510050 and HO → IH; 510300, 159919, and IO → IF; 510500 and 159922 → IC; MO → IM. Products 588000, 588080, 159915, and 159901 use ETF spot quotes without a configured hedge future.
 
-## 数据位置与时间
+## Parquet Storage and Timestamps
 
-只保存五张 Parquet 表：
+The program saves only these five Parquet tables:
 
 ```text
 data/raw/contract_snapshots/
@@ -56,96 +56,96 @@ data/raw/futures_quotes/
 data/metadata/ingestion_runs/
 ```
 
-按 `trade_date`、`exchange`、`hour` 分区，使用 PyArrow、ZSTD 和 UUID part 文件名；重启后只追加新文件。`source` 写接入路径：通过 AKShare 函数获取的行写 `AKShare`，直接从新浪财经获取的行写 `Sina`；部分 AKShare 函数本身也以新浪为上游，具体函数见 `source_interface`。`source_interface` 记录使用的接口；`request_timestamp` 是该行主要行情或合约发现请求的发起时间，OpenCTP 补充请求的时间另记在日志中。`received_timestamp` 记录请求完成后本机收到数据的时间。`quote_timestamp` 与原有 `exchange_timestamp` 只在接口提供完整源日期和时间时填写；没有完整源时间时留空。新浪期权接口若只给 `行情时间`，原样保存在 `source_quote_time`，不会补造日期。源日期未知时，新数据的 trade_date 使用字符串 unknown；hour 仍是收到小时。详见下方新数据时间规则。
+Files are partitioned by `trade_date`, `exchange`, and `hour`. They are written with PyArrow, ZSTD compression, and UUID part filenames, so a restart appends files instead of replacing them. `source=AKShare` identifies rows obtained through AKShare functions; `source=Sina` identifies direct Sina requests. Some AKShare functions also use Sina upstream. `source_interface` records the exact interface and `provider_symbol` keeps the original provider identifier.
 
-缺失价格和数量保持 null。期权买卖一任一侧缺失时 `quote_status` 包含 `BBO_NOT_AVAILABLE`；交叉盘口清空买卖一并标记 `CROSSED_BBO`。状态还可同时包含时间问题，详见下方组合规则。指数行情没有买卖一；ETF 盘口数量和成交量按新浪接口原始单位保存（股），不换算成张。中金所盘口表本身不提供成交量、成交额或完整源时间戳，这些字段为 null。源接口返回 `00:00:00` 或只有日期时，也不能把它当成有效的盘中报价时间：`quote_timestamp` 留空，期权原始文本保留在 `source_quote_time`。本机请求/接收时间只能说明何时观察到该报价，不能证明盘口何时变化。
+`request_timestamp` records when the primary quote or contract-discovery call began. OpenCTP supplement request times are logged separately. `received_timestamp` records when the local machine received the result. `quote_timestamp` and the existing `exchange_timestamp` are populated only from a complete source-supplied date and time. The raw Sina option time field is preserved in `source_quote_time`. The program never supplies a missing date from the local clock. If the source date is unknown, new rows use the literal string `unknown` as `trade_date`. The partition `hour` is the **local receipt hour**, not the source quote hour.
 
-## 如何检查缺失数据
+Missing prices and sizes remain null; last price is not substituted for bid or ask. An option with either BBO side missing receives `BBO_NOT_AVAILABLE` in `quote_status`. If bid exceeds ask, the BBO fields are cleared and the row receives `CROSSED_BBO`. Time problems can be combined with those flags. An index has no tradable BBO. ETF depth sizes and volume retain the raw Sina units (shares), without conversion to option contracts. CFFEX option quote tables do not supply volume, turnover, or a complete source timestamp, so those fields remain null. A source value of `00:00:00` or a date without a specific time does not establish an intraday quote time; the timestamp stays null while the raw option text remains available. Local request and receipt times establish when the program observed a quote, not when its BBO changed.
 
-每 60 秒输出 heartbeat，按产品及表分别报告接收与落盘数量。覆盖日志和质量含义详见下方说明。合约主表仍每 30 分钟刷新，新挂牌合约自动纳入；发现失败时保留已有未到期合约。
+## Coverage, Time Rules, and Quote Quality
 
-所有接口均为 HTTP 轮询，所得行不是逐笔 Tick。沪深两市期权按最多 60 个合约一批读取新浪接口；这能减少逐合约请求，但源站可能延迟、限流或收盘后停更。每轮按“标的与期货 → 期权全链 → 标的与期货”采集，并记录各阶段耗时；前后两次只是为之后配对提供时间窗口，不能让中间全部合约变成同一时刻的行情。源时间完整时可与接收时间比较；源时间缺失时无法判断行情实际更新的时刻。`--interval-seconds 60` 是目标轮询间隔，若一轮超过 60 秒，日志会提示实际耗时。源站结构、访问频率和字段可变；某批请求失败时其余批次和产品继续采集，未返回的合约不会生成伪造报价。旧 Parquet 文件不会被修改，新增数据会生成新的 part 文件。
+The program emits a heartbeat every 60 seconds with per-product and per-table accepted and persisted counts. Contract masters are refreshed every 30 minutes; new contracts are included automatically. If discovery fails, previously known contracts that have not been confirmed expired are retained. The coverage and quality logs report missing contracts and fields.
 
-## 新数据时间规则与状态（本轮修改后）
+All interfaces use HTTP polling, not exchange tick streaming. Sina option requests contain at most 60 contracts per batch. Batching reduces the number of requests, but the source may lag, limit access, or stop updating after the close. Each cycle collects underlyings and futures, the complete selected option chains, then underlyings and futures again. Phase durations are logged. The two surrounding observations bound a later matching window; they do not make every option quote simultaneous. A complete source time can be compared with receipt time but is not automatically a verified BBO timestamp. An absent source time cannot reveal the actual market update time. A failed batch does not stop other independent batches and products, and missing contracts do not generate fabricated quotes. Old Parquet files remain unchanged.
 
-三张行情表都保留明确的旧日期，不再因为源日期与收到日期不同而拒收。
+All three quote tables retain a known older source date. Quotes are no longer rejected solely because the source date differs from the receipt date:
 
-| 数据源信息 | quote_timestamp / exchange_timestamp | trade_date |
+| Source information | `quote_timestamp` / `exchange_timestamp` | `trade_date` |
 | --- | --- | --- |
-| 完整源日期和时刻 | 保留解析结果；不等于已经核实为 BBO 时刻 | 源日期 |
-| 只有日期，或零点日期占位值 | null，保留期权原始 source_quote_time | 源日期 |
-| 源日期未知（包括只有时刻） | null，不拼接本机日期 | 字符串 unknown |
+| Complete, parseable source date and time | Preserve the source value. Its meaning as a BBO timestamp is still unverified. | Source date |
+| Source date only, or midnight used as a date placeholder | null; retain the raw option `source_quote_time`. | Source date |
+| Unknown source date, including a clock time without a date | null; never attach the local date. | `unknown` |
 
-hour 保持接收小时，只是存储分桶，不能与目录里的 trade_date 拼接为报价时刻。request_timestamp / received_timestamp 是本机请求/收到时间；多个 HTTP 请求组成的 AKShare 函数返回的是外层调用范围，不是其中每条报价的发生时间。合约快照按快照日期分区，运行记录按启动日期分区。
+The `hour` partition remains a receipt-hour bucket. Do not combine it with `trade_date` to invent a complete source time. For AKShare functions that make several internal HTTP calls, the recorded request/receipt times bound the **outer function call**, not the event time of each returned quote. Contract snapshots are partitioned by snapshot date; `ingestion_runs` is partitioned by run start date.
 
-quote_status 保留 BBO_NOT_AVAILABLE、CROSSED_BBO，并增加 SOURCE_TIME_DATE_ONLY、SOURCE_TIME_UNKNOWN、TIME_SEMANTICS_UNVERIFIED。问题并存时按盘口、时间精度、时间语义的固定顺序用 | 连接。格式完整不等于已验证：新浪期权的第 32 项、标的的日期/时间、期货的 tradedate/ticktime，尚未得到其严格对应 BBO 更新时刻或统一快照时点的足够依据。指数本身没有可交易 BBO，不计作 ETF 盘口故障。
+Option `quote_status` can contain `BBO_NOT_AVAILABLE`, `CROSSED_BBO`, `SOURCE_TIME_DATE_ONLY`, `SOURCE_TIME_UNKNOWN`, and `TIME_SEMANTICS_UNVERIFIED`. Concurrent issues are joined with `|` in this order: BBO condition, time precision, then time semantics. A complete-looking timestamp is not proof of its meaning. There is insufficient evidence that Sina option field 32, underlying date/time fields, or futures `tradedate`/`ticktime` strictly represent the corresponding BBO update time or one synchronized snapshot instant. Missing BBO on an index is not treated as an ETF quote failure.
 
-原始观测全部按既有有效值校验保存；不在线查重，不扫描历史文件，不按最大已见时间过滤迟到数据。不能确认时间的记录不直接用于严格的盘中时间配对。本轮没有实现 IV、Greeks、曲面、PnL 或历史回填。
+The collector saves raw observations that pass the existing value checks. It does not scan earlier Parquet files, remove consecutive identical quotes, or discard late records based on the latest previously seen timestamp. Do not use quotes with uncertain timing directly for strict intraday matching. This project does not calculate IV, Greeks, volatility surfaces, PnL, or historical backfills.
 
-## 请求保护、期货范围及退出
+## Network Protection, Futures Scope, and Shutdown
 
-所有采集网络调用串行进入一个可终止子进程，默认单次调用总等待目标上限 15 秒，包含首次加载依赖、AKShare 内部多次请求和结果序列化。直接 HTTP 请求另有 3 秒连接、10 秒读取超时；没有 timeout 参数的 AKShare 函数使用进程总期限，不改函数签名或全局 Requests。超时先终止旧进程再允许下一次调用，进程清理最多再等待约 2 秒。主线程等待时仍检查 flush 和 heartbeat；磁盘操作和操作系统严重阻塞不属于网络时限。
+All collection network calls run serially through one terminable subprocess. The default target upper bound is 15 seconds per call, including the first dependency import, internal AKShare requests, and result serialization. Direct HTTP calls also use a 3-second connection timeout and a 10-second read timeout. AKShare functions without a `timeout` parameter rely on the subprocess deadline; the program does not invent unsupported parameters or modify global Requests settings. After a timeout, it terminates the old process before issuing another call; cleanup can add up to about two seconds. The main thread checks buffer flush and heartbeat while waiting. Disk operations and severe operating-system blocking are outside this network deadline.
 
-这不增加采集并发。正常调用复用工作进程的会话和 AKShare 自带缓存；进程超时终止后缓存重新建立。没有返回的网络结果无法保证取得。已经返回的有效记录会继续整理入缓冲，不因正常停止而无声丢弃。
+This design does not add concurrent market-data requests. Normal calls reuse the worker's network session and AKShare's built-in cache; a terminated worker rebuilds its cache. A response that never arrived cannot be recovered. Valid results already returned are normalized and buffered even if a normal stop was requested.
 
-Ctrl+C / SIGTERM 停止新请求，保存缓冲和 ingestion_runs 后才恢复信号处理。保存期间重复正常停止信号不会主动打断保存。写盘失败非零退出，失败批次不主动清空；不能保证断电、强制杀进程或磁盘故障时保存成功。
+`Ctrl+C` or `SIGTERM` stops new requests. The program flushes buffers, records the run, and only then restores its original signal handlers. Repeated normal stop signals do not intentionally interrupt the final flush. A write failure causes a nonzero exit without clearing the failed batch from memory. Power loss, forced termination, and disk failure can still prevent a successful save.
 
-日志保存到 logs/collect-live.log，每文件 10 MiB，最多 3 个轮转备份，时间为 Asia/Shanghai。它不是第六张行情表。用 run_id 查找开始/结束摘要。
+The application's log is `logs/collect-live.log`, using Asia/Shanghai timestamps. Each file is limited to 10 MiB with up to three rotated backups. This is not a sixth quote table. Use `run_id` to find a run's start and end summaries.
 
-东方财富 option_current_em 只在 SSE 主报价缺失或校验失败时按现有条件调用，一轮最多一次；连续失败 3 次暂停 300 秒，到期尝试成功清零，失败再次暂停。它不提供本程序需要的 BBO/源时间，不能修补这些缺项。不会把不同请求取得的字段拼成一个伪造的同时刻快照，不会自动修改代理。
+The Eastmoney `option_current_em` interface is only an optional supplement for SSE quotes missing or rejected by the primary path. It is called at most once per cycle. After three consecutive failures it pauses for 300 seconds; a successful retry resets the count. Its current wrapper does not supply the BBO or source timestamp needed here. The program does not combine fields from separate requests into a fabricated simultaneous quote or alter proxy settings.
 
-期货在发出请求前，从本次 registry 产品得到需要的品种，再精确匹配已核对的新浪名称表。Provider 标识映射为 IF→qz_qh、IH→szgz_qh、IC→zzgz_qh、IM→im_qh。只选 510050 时仅请求 IH，全产品请求 IH/IF/IC/IM；返回的实际月份合约分别保存，不写死月份，不请求无关国债期货。此标识转换不替代 registry 的产品选择和期权到期货映射。futures_symbol_mark 已有 AKShare 进程内缓存。
+Before making futures requests, the program selects the needed IH/IF/IC/IM products from the registry, then matches exact product identifiers in the checked Sina name table. Provider identifiers are IF → `qz_qh`, IH → `szgz_qh`, IC → `zzgz_qh`, and IM → `im_qh`. Selecting only 510050 requests IH; selecting all products requests IH/IF/IC/IM. Returned actual-month futures contracts are stored individually, without hard-coded months or unrelated Treasury futures requests. This provider-identifier conversion does not replace the registry's option-to-future mappings. AKShare already caches `futures_symbol_mark` inside its process.
 
-## 可选交易时段控制
+## Optional Trading-Hours Control
 
-原来的启动命令保持不变。启用可选限制：
+The original launch commands still work. Add the optional switch to restrict requests to the configured trading windows:
 
 ```bash
 python -m cn_option_data.cli collect-live --products all --interval-seconds 60 --trading-hours-only
 ```
 
-读取 config/trading_calendar.json，不每轮下载日历。提供完整 2026 年周末及法定休市安排，来源和核对说明见 JSON。沪深官方公告已核对；中金所原站本次请求超时，年度正文通过 CFFEX 发布公告的公开转载核对，此来源限制如实保留。
+The program reads `config/trading_calendar.json`; it does not download the calendar every cycle. The file covers 2026 weekends and exchange holidays, and records its sources and verification limitations. SSE/SZSE official notices were checked. A direct request to the CFFEX website timed out, so the annual notice was checked using a publicly syndicated copy of CFFEX's publication; that limitation remains documented.
 
-共同采样窗口为 09:30–11:30、13:00–15:00（含 ETF 收盘集合竞价，不含开盘集合竞价），不声称覆盖所有竞价阶段。非窗口期间不发起请求，但保留 heartbeat、flush 和退出响应。日历缺失、无效或超出有效年份时明确失败，不把新一年沿用旧日历推算。跨年或临时休市公告发布后，依据正式公告更新配置并重启；程序载入后在内存使用。
+The common Asia/Shanghai sampling windows are 09:30–11:30 and 13:00–15:00. They include the ETF closing auction but not the opening auction, and do not claim to cover every auction phase. Outside these windows, the program makes no quote requests but continues heartbeat, flush, and shutdown handling. A missing/invalid calendar or a date beyond its coverage is an explicit error, never an assumption that the market is open. Update the calendar from official notices and restart after a new year or an exceptional closure; the loaded version is kept in memory.
 
-不开启该开关，仍可手动在休市时检查接口。时段控制只决定何时请求，不重新加入“源日期必须等于今天”的过滤。
+Without the switch, interfaces may still be checked manually when the market is closed. Trading-hours control changes when requests are made, not the rule for retaining quotes with an older source date.
 
-## 合约资料补充依据
+## Contract Metadata Sources
 
-ETF 最小报价单位 0.0001 元/份依据上交所第 59 条、深交所 4.3.18；不覆盖调整合约的实际合约单位。上交所最后交易日缺失时，仅在当日主表到期日与行权日一致时，依据第 9 条补为该日期；日期冲突留空并记录。深交所保留主表实际最后交易日。没有按合约月份自行推算日期。
+The minimum ETF option quote increment is CNY 0.0001 per ETF unit under SSE Article 59 and SZSE Rule 4.3.18. The program preserves each adjusted contract's actual unit. When an SSE last trading date is absent, the current master supplies it only if the expiry and exercise dates agree, following Article 9. Conflicts remain null and are logged. The SZSE master-supplied last trading date is retained. No expiry day is guessed from the contract month.
 
-- [上交所规则，第9、59条](https://www.sse.com.cn/lawandrules/sselawsrules2025/option/c/c_20250610_10781448.shtml)
-- [深交所规则，2.5、4.3.18](https://docs.static.szse.cn/www/option/rules/optrules/W020191207434561721119.pdf)
-- [中金所上证50股指期权合约表，到期日同最后交易日](https://www.cffex.com.cn/cn/sz50gzqq.html)
+- [SSE rules, Articles 9 and 59](https://www.sse.com.cn/lawandrules/sselawsrules2025/option/c/c_20250610_10781448.shtml)
+- [SZSE rules, Sections 2.5 and 4.3.18](https://docs.static.szse.cn/www/option/rules/optrules/W020191207434561721119.pdf)
+- [CFFEX SSE 50 index option contract specifications: expiry and last trading date](https://www.cffex.com.cn/cn/sz50gzqq.html)
 
-规则按 2026-09-27 查阅的适用文本记录；ETF 合约快照 source_interface 包含规则来源，日志记录适用日期和缺失字段。OpenCTP 的中金所日期结合交易所到期日同最后交易日规则使用，不等于全部资料已获交易所独立认证。日期字段的午夜只代表日期精度，不是精确到期时刻。
+These applicable rules were checked on 2026-09-27. ETF contract snapshots include the rule source in `source_interface`; logs record the application date and missing terms. OpenCTP CFFEX dates are used alongside the exchange rule relating expiry and last trading dates, but that does not mean every term has been independently certified by the exchange. Midnight in a contract-date field expresses date precision, not a verified expiry instant.
 
-## 字段能力与未解决缺项
+## Field Availability and Remaining Gaps
 
-| 产品 | 当前期权接口 | 能力边界 |
+| Products | Current option quote interface | Availability and limits |
 | --- | --- | --- |
-| 510050、510300、510500、588000、588080 | 新浪 CON_OP 批量，必要时东方财富补充 | 新浪映射 BBO、买卖量、最新价、成交量/额、持仓、涨跌停、原始时间；单条仍可能缺值。东方财富当前包装输出没有 BBO、源时间、涨跌停 |
-| 159919、159922、159915、159901 | 新浪 CON_OP 批量 | 同上新浪字段；缺一侧 BBO 不中止其他产品 |
-| HO | option_cffex_sz50_spot_sina | BBO、买卖量、最新价、持仓；包装输出没有成交量、成交额、源时间、涨跌停 |
-| IO | option_cffex_hs300_spot_sina | 同 HO |
-| MO | option_cffex_zz1000_spot_sina | 同 HO |
+| 510050, 510300, 510500, 588000, 588080 | Batched Sina `CON_OP`; Eastmoney supplement if needed | Sina fields are mapped to BBO, sizes, last price, volume, turnover, open interest, price limits, and raw time. Individual rows may still lack values. The Eastmoney wrapper does not provide BBO, source time, or price limits. |
+| 159919, 159922, 159915, 159901 | Batched Sina `CON_OP` | Same Sina field mapping; a missing BBO side does not stop other products. |
+| HO | `option_cffex_sz50_spot_sina` | BBO, sizes, last price, and open interest; the wrapper does not provide volume, turnover, source time, or price limits. |
+| IO | `option_cffex_hs300_spot_sina` | Same limits as HO. |
+| MO | `option_cffex_zz1000_spot_sina` | Same limits as HO. |
 
-这张表区分接口包装不输出的字段；单条缺值、拒收和未返回由覆盖/质量日志体现。本轮没有确认某个新来源可补齐所有字段。利率/贴现、分红或远期处理方案、完整期货条款、费用/保证金/资金成本仍是后续研究输入，本轮不填假设值。
+This table distinguishes fields absent from the interface wrappers. Coverage and quality logs identify missing values in individual rows, rejected rows, and contracts without returned quotes. No alternative source has been verified to provide every missing field. Interest rates/discounting, dividends or forward estimates, complete futures contract terms, fees, margin, and funding costs remain inputs for later research; this project does not fill them with assumptions.
 
-每轮日志分别显示 discovered、returned、accepted、missing、rejected 和代码清单。heartbeat 按产品和表分开显示 accepted（进入缓冲）与 persisted（成功写盘），并显示缓冲行数和质量问题累计数。PARTIAL 可以来自接口、覆盖或时间/字段问题，不等于退出未保存；FAILED 表示致命本地错误，最终写盘失败时不能认定保存完成。
+Every cycle logs `discovered`, `returned`, `accepted`, `missing`, and `rejected` counts and contract codes. Heartbeats distinguish `accepted` (added to a buffer) from `persisted` (written to disk), by table and product, and report buffered rows and cumulative quality problems. `PARTIAL` can indicate an interface, coverage, timestamp, or field issue; it does not necessarily indicate a failed final flush. `FAILED` indicates a fatal local error. A final write failure must not be reported as successful storage.
 
-修改只影响新文件，旧 Parquet 不迁移、不覆盖。旧分区中的收到日期不自动变成源日期，旧 quote_status=OK 不代表时间可信。应根据原始时间和修改后的运行起止时间区分，不直接混用新旧状态语义。
+These changes affect only new files. Existing Parquet data is neither migrated nor overwritten. An old partition based on a receipt date is not automatically corrected to the source date, and an old `quote_status=OK` does not establish trustworthy timing. Use original timestamps and run periods to distinguish old and new status semantics before combining them.
 
-## 人工短跑和只读检查
+## Manual Short Run and Read-Only Inspection
 
-在真实交易时段运行数轮后按 Ctrl+C，等待“采集结束”及 buffered_rows=0：
+During trading hours, run a few cycles and press `Ctrl+C`. Wait for the completion message and `buffered_rows=0`:
 
 ```bash
 source .venv/bin/activate
 python -m cn_option_data.cli collect-live --products 510050 --interval-seconds 60
 ```
 
-下面只读最近文件，不修改数据：
+The following reads recent files without modifying them:
 
 ```bash
 python - <<'PY'
@@ -164,4 +164,4 @@ for folder in ('data/metadata/ingestion_runs', 'data/raw/option_quotes'):
 PY
 ```
 
-全量读取时显式声明 Hive 分区为字符串，或逐个 ParquetFile 读取，避免 hour 自动推断为整数导致类型冲突。unknown 必须作为未知保留；日期筛选可用 pandas.to_datetime(..., errors="coerce") 得到 NaT 并另列未知组，不能替换为本机日期。检查每产品覆盖、时间精度、字段缺失和一轮真实耗时后，再决定是否调整 60 秒间隔。
+For full reads, explicitly declare Hive partition fields as strings or read each `ParquetFile` separately. This avoids type conflicts if `hour` is inferred as an integer. Keep `unknown` as an unknown source date. Date filters can use `pandas.to_datetime(..., errors="coerce")` to obtain `NaT` and report the unknown group separately; never replace those dates with the local date. Check per-product coverage, timestamp precision, missing fields, and actual cycle duration before changing the 60-second target interval.
