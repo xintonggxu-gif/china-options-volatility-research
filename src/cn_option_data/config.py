@@ -16,7 +16,12 @@ class LiveConfig:
     refresh_interval_seconds: float = 1800.0
     heartbeat_interval_seconds: float = 60.0
     request_timeout_seconds: float = 15.0
+    discovery_retry_seconds: float = 90.0
     trading_hours_only: bool = False
+    single_cycle: bool = False
+    run_mode: str = "live"
+    # Separate files keep a cron snapshot from rotating the live collector's log.
+    log_name: str = "collect-live.log"
 
     @property
     def calendar_path(self) -> Path:
@@ -24,7 +29,7 @@ class LiveConfig:
 
     @property
     def log_path(self) -> Path:
-        return self.project_root / "logs" / "collect-live.log"
+        return self.project_root / "logs" / self.log_name
 
     @property
     def registry_path(self) -> Path:
@@ -46,6 +51,9 @@ def load_live_config(
     max_buffer_rows: int = 50_000,
     project_root: Path | None = None,
     trading_hours_only: bool = False,
+    single_cycle: bool = False,
+    run_mode: str = "live",
+    log_name: str = "collect-live.log",
 ) -> LiveConfig:
     if not math.isfinite(interval_seconds) or interval_seconds <= 0:
         raise ValueError("interval-seconds 必须大于 0")
@@ -57,4 +65,7 @@ def load_live_config(
         flush_interval_seconds=flush_interval_seconds,
         max_buffer_rows=max_buffer_rows,
         trading_hours_only=trading_hours_only,
+        single_cycle=single_cycle,
+        run_mode=run_mode,
+        log_name=log_name,
     )

@@ -193,6 +193,8 @@ class LiveCollector:
             "source_interface": quote.get("source_interface"),
             "request_timestamp": quote.get("request_timestamp"),
             "provider_symbol": quote.get("provider_symbol", symbol),
+            "batch_id": quote.get("batch_id"),
+            "run_id": self.run_id,
         }
         if table in {"option_quotes", "underlying_quotes"}:
             row["amount"] = values["amount"]
@@ -210,9 +212,22 @@ class LiveCollector:
         self.product_rows[product_id] += 1
         return "ACCEPTED"
 
+    def _append_underlying(self, symbol: str, quote: dict[str, Any], product: Product, phase: str) -> None:
+        self._append_quote("underlying_quotes", symbol, quote, product.product_id, {
+            "underlying_symbol": symbol, "product_id": product.product_id, "collection_phase": phase,
+        }, product.exchange)
+
+    def _append_future(self, symbol: str, quote: dict[str, Any], product_id: str, phase: str) -> None:
+        self._append_quote("futures_quotes", symbol, quote, product_id, {
+            "future_symbol": symbol, "future_product": symbol[:2],
+            "mapped_option_product": product_id, "collection_phase": phase,
+        }, "CFFEX")
+
     def _collect(self, provider: AKShareLive) -> None:
         # Bracket a chain poll with the corresponding underlying and futures
-        # observations. Each family is isolated from other HTTP failures.
+        # observations. The options phase also returns each product's underlying
+        # and futures from the same Sina responses (collection_phase="bundled",
+        # joined to options by batch_id). Each family is isolated from other HTTP failures.
         families = (
             ("underlying_before", "underlying_quotes", provider.get_underlying_quotes, None),
             ("futures_before", "futures_quotes", provider.get_futures_quotes, None),
@@ -225,7 +240,7 @@ class LiveCollector:
                 break
             started = time.monotonic()
             try:
-                quotes = get_quotes(argument) if argument is not None else get_quotes()
+                result = get_quotes(argument) if argument is not None else get_quotes()
             except (StorageWriteError, CalendarError):
                 raise
             except Exception as exc:
@@ -235,7 +250,20 @@ class LiveCollector:
                     for contract in self.active_options.values():
                         self.diagnostics[contract.product.product_id] = "INTERFACE_ERROR"
                 continue
-            LOG.info("采集阶段 cycle=%s phase=%s seconds=%.1f returned=%s", self.cycle, phase, time.monotonic() - started, len(quotes))
+            if table == "option_quotes":
+                quotes = result.options
+                for product_id, symbol, quote in result.underlyings:
+                    self._append_underlying(symbol, quote, self.by_product[product_id], "bundled")
+                for product_id, symbol, quote in result.futures:
+                    self._append_future(symbol, quote, product_id, "bundled")
+                LOG.info("采集阶段 cycle=%s phase=%s seconds=%.1f returned=%s bundled_underlying=%s bundled_futures=%s",
+                         self.cycle, phase, time.monotonic() - started, len(quotes),
+                         len(result.underlyings), len(result.futures))
+            else:
+                quotes = result
+                LOG.info("采集阶段 cycle=%s phase=%s seconds=%.1f returned=%s", self.cycle, phase,
+                         time.monotonic() - started, len(quotes))
+            bracket = phase.rsplit("_", 1)[-1]
             outcomes: dict[str, str] = {}
             for symbol, quote in quotes.items():
                 if table == "option_quotes":
@@ -252,16 +280,10 @@ class LiveCollector:
                     }, contract.product.exchange)
                 elif table == "underlying_quotes":
                     for product in self.underlyings.get(symbol, []):
-                        self._append_quote(table, symbol, quote, product.product_id, {
-                            "underlying_symbol": symbol, "product_id": product.product_id,
-                        }, product.exchange)
+                        self._append_underlying(symbol, quote, product, bracket)
                 else:
-                    future_product = symbol[:2]
-                    for product_id in self.future_products_to_options.get(future_product, []):
-                        self._append_quote(table, symbol, quote, product_id, {
-                            "future_symbol": symbol, "future_product": future_product,
-                            "mapped_option_product": product_id,
-                        }, "CFFEX")
+                    for product_id in self.future_products_to_options.get(symbol[:2], []):
+                        self._append_future(symbol, quote, product_id, bracket)
             if table == "option_quotes":
                 for product in self.products:
                     product_id = product.product_id
@@ -333,20 +355,44 @@ class LiveCollector:
             waiting = False
             if time.monotonic() >= next_refresh or self.last_registry_date != now_shanghai().date():
                 self._refresh(provider)
-                next_refresh = time.monotonic() + self.config.refresh_interval_seconds
+                failed = self._discovery_failures()
+                # A one-shot snapshot has no later refresh, so retry discovery briefly now.
+                attempt = 1
+                while failed and self.config.single_cycle and attempt < 3 and not self.stop_requested:
+                    LOG.warning("合约发现失败 products=%s，5 秒后重试 attempt=%s", failed, attempt + 1)
+                    self._wait(5.0)
+                    self._refresh(provider)
+                    failed = self._discovery_failures()
+                    attempt += 1
+                # A failed contract master would otherwise leave its products uncollected
+                # until the next 30-minute refresh.
+                delay = self.config.discovery_retry_seconds if failed else self.config.refresh_interval_seconds
+                if failed:
+                    LOG.warning("合约发现失败 products=%s，%.0f 秒后重试", failed, delay)
+                next_refresh = time.monotonic() + delay
             if self._requests_paused():
                 continue
             cycle_started = time.monotonic()
             self.cycle += 1
             self._collect(provider)
             self._maintenance()
+            if self.config.single_cycle:
+                LOG.info("单次快照完成 cycle=%s seconds=%.1f", self.cycle, time.monotonic() - cycle_started)
+                self.stop_requested = True
+                break
             elapsed = time.monotonic() - cycle_started
             if elapsed > self.config.interval_seconds:
                 LOG.warning("轮询耗时 %.1f 秒，超过设置间隔 %.1f 秒", elapsed, self.config.interval_seconds)
-            wait_until = time.monotonic() + max(1.0, self.config.interval_seconds - elapsed)
-            while not self.stop_requested and time.monotonic() < wait_until:
-                time.sleep(min(0.5, wait_until - time.monotonic()))
-                self._maintenance()
+            self._wait(max(1.0, self.config.interval_seconds - elapsed))
+
+    def _discovery_failures(self) -> list[str]:
+        return sorted(pid for pid, status in self.diagnostics.items() if status == "INTERFACE_ERROR")
+
+    def _wait(self, seconds: float) -> None:
+        wait_until = time.monotonic() + seconds
+        while not self.stop_requested and time.monotonic() < wait_until:
+            time.sleep(max(0.0, min(0.5, wait_until - time.monotonic())))
+            self._maintenance()
 
     def run(self) -> None:
         previous_sigint = signal.getsignal(signal.SIGINT)
@@ -356,7 +402,7 @@ class LiveCollector:
         backoff = 1.0
         provider: AKShareLive | None = None
         fatal = False
-        LOG.info("采集开始 run_id=%s interval=%s trading_hours_only=%s", self.run_id,
+        LOG.info("采集开始 run_id=%s mode=%s interval=%s trading_hours_only=%s", self.run_id, self.config.run_mode,
                  self.config.interval_seconds, self.config.trading_hours_only)
         if self.calendar:
             LOG.info("日历覆盖 %s 至 %s verified_on=%s sources=%s", self.calendar.start,
@@ -383,6 +429,10 @@ class LiveCollector:
                         fatal = True
                         self._record_error(type(write_error).__name__, str(write_error))
                         raise
+                    if self.config.single_cycle:
+                        LOG.exception("单次快照失败，不重试")
+                        self.stop_requested = True
+                        break
                     LOG.exception("采集会话中断，%.1f 秒后重试", backoff)
                     until = time.monotonic() + backoff
                     while not self.stop_requested and time.monotonic() < until:
@@ -424,6 +474,7 @@ class LiveCollector:
                     "quote_rows_written": self.writer.quote_rows_written,
                     "error_type": self.last_error_type or ("PRODUCT_OR_DATA_QUALITY" if problems else None),
                     "error_message": ("; ".join(filter(None, [self.last_error_message, *problems])) or None),
+                    "run_mode": self.config.run_mode,
                 })
                 self.writer.flush()
                 self._heartbeat()

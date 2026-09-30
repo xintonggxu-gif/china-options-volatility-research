@@ -26,6 +26,8 @@ BBO = [
     ("ask_price1", F), ("ask_volume1", I),
     ("last_price", F), ("volume", I),
 ]
+# batch_id: one Sina HTTP response; rows sharing it were observed together.
+BATCH = [("batch_id", S), ("run_id", S)]
 
 SCHEMAS = {
     "contract_snapshots": pa.schema([
@@ -47,24 +49,28 @@ SCHEMAS = {
         ("quote_timestamp", TS), ("source_quote_time", S),
         ("source_interface", S), ("request_timestamp", TS),
         ("supplement_request_timestamp", TS), ("quote_status", S),
+        *BATCH,
     ]),
     "underlying_quotes": pa.schema([
         *STAMP, *PARTITION,
         ("underlying_symbol", S), ("product_id", S),
         *BBO, ("amount", F), ("source", S), ("provider_symbol", S),
         ("quote_timestamp", TS), ("source_interface", S), ("request_timestamp", TS),
+        *BATCH, ("collection_phase", S),
     ]),
     "futures_quotes": pa.schema([
         *STAMP, *PARTITION,
         ("future_symbol", S), ("future_product", S), ("mapped_option_product", S),
         *BBO, ("open_interest", I), ("source", S), ("provider_symbol", S),
         ("quote_timestamp", TS), ("source_interface", S), ("request_timestamp", TS),
+        *BATCH, ("collection_phase", S),
     ]),
     "ingestion_runs": pa.schema([
         ("run_id", S), ("started_at", TS), ("finished_at", TS),
         *PARTITION, ("provider", S), ("status", S),
         ("contracts_discovered", I), ("products_discovered", I),
         ("quote_rows_written", I), ("error_type", S), ("error_message", S),
+        ("run_mode", S),
     ]),
 }
 

@@ -8,12 +8,14 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import os
+import re
 from pathlib import Path
 
 from .config import load_live_config
 from .registry import load_registry
-from .models import SHANGHAI
+from .models import SHANGHAI, now_shanghai
 from .storage.parquet_writer import StorageWriteError
+from .trading_calendar import TradingCalendar
 
 
 class ShanghaiFormatter(logging.Formatter):
@@ -42,6 +44,11 @@ def main() -> None:
     live.add_argument("--max-buffer-rows", type=int, default=50_000)
     live.add_argument("--project-root", type=Path, help="项目根目录；默认使用安装包所在项目")
     live.add_argument("--trading-hours-only", action="store_true", help="只在已核实日历的采样窗口轮询；默认不启用")
+    snapshot = commands.add_parser("collect-snapshot", help="采集一轮完整期权链后退出，供定时任务在收盘前后调用")
+    snapshot.add_argument("--products", default="all", help="all、单个产品 ID 或逗号分隔的产品 ID")
+    snapshot.add_argument("--label", default="snapshot", help="写入 ingestion_runs.run_mode 的标签，例如 close 或 preclose")
+    snapshot.add_argument("--project-root", type=Path, help="项目根目录；默认使用安装包所在项目")
+    snapshot.add_argument("--force", action="store_true", help="跳过交易日检查（非交易日或日历未覆盖的日期）")
     history = commands.add_parser("backfill-daily", help="预览或执行有来源核实的逐日历史回填")
     history.add_argument("--products", default="all", help="all、单个产品 ID 或逗号分隔的产品 ID")
     history.add_argument("--start-date", required=True, help="首个日期 YYYY-MM-DD（必填）")
@@ -75,15 +82,32 @@ def main() -> None:
         except (StorageWriteError, OSError) as exc:
             parser.exit(1, f"历史数据保存失败: {exc}\n")
     try:
-        config = load_live_config(
-            interval_seconds=args.interval_seconds,
-            flush_interval_seconds=args.flush_interval_seconds,
-            max_buffer_rows=args.max_buffer_rows,
-            project_root=args.project_root,
-            trading_hours_only=args.trading_hours_only,
-        )
+        if args.command == "collect-snapshot":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", args.label):
+                raise ValueError("--label 只能包含字母、数字、下划线和连字符")
+            config = load_live_config(
+                interval_seconds=60.0,
+                project_root=args.project_root,
+                single_cycle=True,
+                run_mode=f"snapshot:{args.label}",
+                log_name="collect-snapshot.log",
+            )
+        else:
+            config = load_live_config(
+                interval_seconds=args.interval_seconds,
+                flush_interval_seconds=args.flush_interval_seconds,
+                max_buffer_rows=args.max_buffer_rows,
+                project_root=args.project_root,
+                trading_hours_only=args.trading_hours_only,
+            )
         products = load_registry(config.registry_path, args.products)
         configure_logging(config.log_path)
+        if args.command == "collect-snapshot" and not args.force:
+            today = now_shanghai().date()
+            calendar = TradingCalendar(config.calendar_path, {p.exchange for p in products})
+            if not calendar.is_trading_day(today):
+                logging.getLogger(__name__).info("%s 不是交易日，快照未发起请求", today)
+                return
         from .collectors.live_collector import LiveCollector
 
         LiveCollector(config, products).run()

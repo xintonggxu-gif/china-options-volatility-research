@@ -7,12 +7,13 @@ import re
 import json
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable
 
 from ..models import OptionContract, SHANGHAI, source_datetime, finite_number, now_shanghai
 from ..registry import Product
-from .sina_quotes import SinaQuotes
+from .sina_quotes import SinaQuotes, cffex_option_symbol
 from .bounded_calls import BoundedCalls, CallCancelled, NetworkCallError
 from ..storage.parquet_writer import StorageWriteError
 from ..trading_calendar import CalendarError
@@ -76,6 +77,24 @@ def _record(row: Any) -> dict[str, Any]:
     return {str(key).strip(): value for key, value in row.items()}
 
 
+def sina_underlying_symbol(product: Product) -> str:
+    """Registry SSE.510050 -> sh510050; SZSE.159919 -> sz159919; SSE.000300 -> sh000300."""
+    exchange, code = product.underlying_symbol.split(".", 1)
+    return ("sh" if exchange == "SSE" else "sz") + code
+
+
+@dataclass
+class ChainQuotes:
+    """Option quotes plus the underlying/futures observed in the same Sina responses.
+
+    ``underlyings`` and ``futures`` hold (product_id, symbol, quote) triples; the
+    quote's ``batch_id`` equals the batch_id of the options fetched with it.
+    """
+    options: dict[str, dict[str, Any]] = field(default_factory=dict)
+    underlyings: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+    futures: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+
+
 class AKShareLive:
     def __init__(self, products: list[Product], should_stop: Callable[[], bool] | None = None,
                  on_wait: Callable[[], None] = lambda: None, request_timeout: float = 15.0):
@@ -91,6 +110,8 @@ class AKShareLive:
         self.months: dict[str, set[str]] = {}
         self.diagnostics: dict[str, str] = {}
         self._future_market_names: list[str] | None = None
+        # IF/IH/IC/IM -> contract symbols returned by the latest futures_zh_realtime call.
+        self.future_symbols: dict[str, list[str]] = {}
         self._cffex_reference_date: date | None = None
         self._cffex_reference: dict[str, date] = {}
         self.calls = BoundedCalls(timeout=request_timeout, should_stop=self.should_stop, on_wait=on_wait)
@@ -404,91 +425,138 @@ class AKShareLive:
         self._em_retry_at = 0.0
         return {_code(row.get("代码")).upper(): (row, requested, received) for row in rows}
 
-    def get_option_quotes(self, contracts: dict[str, OptionContract]) -> dict[str, dict[str, Any]]:
-        quotes: dict[str, dict[str, Any]] = {}
+    @staticmethod
+    def _option_symbol(contract: OptionContract) -> str:
+        if contract.product.exchange == "CFFEX":
+            return cffex_option_symbol(contract.contract_code)
+        return "CON_OP_" + contract.contract_code
+
+    def _anchor_symbols(self, product: Product) -> list[str]:
+        """The product's underlying plus every listed month of its hedge future."""
+        futures = self.future_symbols.get(product.hedge_future, []) if product.hedge_future else []
+        return [sina_underlying_symbol(product), *("CFF_RE_" + symbol for symbol in futures)]
+
+    def get_option_quotes(self, contracts: dict[str, OptionContract]) -> ChainQuotes:
+        chain = ChainQuotes()
         if not contracts:
-            return quotes
+            return chain
         for product_id, status in list(self.diagnostics.items()):
             if status == "INVALID_QUOTE":
                 self.diagnostics.pop(product_id)
-        # AKShare's single-contract SSE function uses this same Sina endpoint.
-        # Fetching verified symbols in bounded batches removes hundreds of
-        # sequential network requests without changing the quote fields.
-        etfs = {code: c for code, c in contracts.items() if c.product.exchange in {"SSE", "SZSE"}}
-        sina = self.sina.fetch(["CON_OP_" + code for code in etfs]) if etfs else {}
-        missing = [code for code in etfs if "CON_OP_" + code not in sina]
-        if 0 < len(missing) <= 60 and not self.should_stop():
-            sina.update(self.sina.fetch(["CON_OP_" + code for code in missing], batch_size=20))
-        # Eastmoney remains a last-price-only fallback for missing SSE quotes.
-        em: dict[str, tuple[dict[str, Any], datetime, datetime]] | None = None
-        fallback_missing = []
-        for code, contract in etfs.items():
-            item = sina.get("CON_OP_" + code)
-            if item is not None:
-                fields, requested, received = item
-                raw = self.sina.option(fields, code, contract.product.product_id,
-                                       contract.option_class, contract.strike_price, requested, received)
-                if raw is not None:
-                    raw["quote_timestamp"] = _quote_datetime(raw["quote_timestamp"])
-                    quotes[code] = raw
-                    continue
-                LOG.warning("Sina 合约字段与主表不一致 contract=%s product=%s", code, contract.product.product_id)
-                self.diagnostics[contract.product.product_id] = "INVALID_QUOTE"
-            if contract.product.exchange == "SSE":
-                if em is None and not self.should_stop():
-                    em = self._em_quotes()
-                fallback = (em or {}).get(code.upper())
-                if fallback is not None:
-                    row, requested, received = fallback
-                    quotes[code] = {
-                        **self._base_quote("option_current_em", requested, received),
-                        "last_price": row.get("最新价"), "volume": row.get("成交量"),
-                        "amount": row.get("成交额"), "open_interest": row.get("持仓量"),
-                        "provider_symbol": code,
-                    }
+        # One product's chain is requested together with its underlying and hedge
+        # futures, so each option has an underlying observed in the same response
+        # (shared batch_id). AKShare's single-contract SSE function uses this same
+        # Sina endpoint; CFFEX P_OP_ fields were checked against the AKShare tables.
+        for product in self.products:
+            if self.should_stop():
+                break
+            members = {code: c for code, c in contracts.items() if c.product.product_id == product.product_id}
+            if not members:
+                continue
+            symbol_of = {code: self._option_symbol(contract) for code, contract in members.items()}
+            underlying = sina_underlying_symbol(product)
+            anchors = self._anchor_symbols(product)
+            results, anchor_rows = self.sina.fetch_bundled(anchors, list(symbol_of.values()))
+            missing = [symbol for symbol in symbol_of.values() if symbol not in results]
+            if 0 < len(missing) <= 60 and not self.should_stop():
+                more, more_anchors = self.sina.fetch_bundled(anchors, missing, batch_size=20)
+                results.update(more)
+                anchor_rows += more_anchors
+            for symbol, item in anchor_rows:
+                if symbol == underlying:
+                    raw = self.sina.underlying(item.fields, symbol, item.requested, item.received)
+                    target, key = chain.underlyings, product.underlying_symbol
                 else:
-                    fallback_missing.append(code)
+                    raw = self.sina.future(item.fields, symbol, item.requested, item.received)
+                    target, key = chain.futures, symbol.removeprefix("CFF_RE_")
+                if raw is None:
+                    continue
+                raw["quote_timestamp"] = _quote_datetime(raw["quote_timestamp"])
+                raw["batch_id"] = item.batch_id
+                target.append((product.product_id, key, raw))
+            cffex = product.exchange == "CFFEX"
+            for code, contract in members.items():
+                item = results.get(symbol_of[code])
+                if item is None:
+                    continue
+                raw = self.sina.option(item.fields, symbol_of[code], underlying if cffex else product.product_id,
+                                       contract.option_class, contract.strike_price, item.requested, item.received,
+                                       # CFFEX turnover is price x contracts in index points; x100 gives CNY.
+                                       amount_multiplier=CFFEX_OPTION_MULTIPLIER if cffex else 1.0)
+                if raw is None:
+                    LOG.warning("Sina 合约字段与主表不一致 contract=%s product=%s", code, product.product_id)
+                    self.diagnostics[product.product_id] = "INVALID_QUOTE"
+                    continue
+                raw["quote_timestamp"] = _quote_datetime(raw["quote_timestamp"])
+                raw["batch_id"] = item.batch_id
+                chain.options[code] = raw
+        self._fill_missing_sse(contracts, chain.options)
+        self._fill_missing_cffex(contracts, chain.options)
+        return chain
+
+    def _fill_missing_sse(self, contracts: dict[str, OptionContract], quotes: dict[str, dict[str, Any]]) -> None:
+        """Eastmoney remains a last-price-only fallback for missing SSE quotes."""
+        missing = [code for code, c in contracts.items() if c.product.exchange == "SSE" and code not in quotes]
+        if not missing or self.should_stop():
+            return
+        em = self._em_quotes()
+        fallback_missing = []
+        for code in missing:
+            fallback = em.get(code.upper())
+            if fallback is None:
+                fallback_missing.append(code)
+                continue
+            row, requested, received = fallback
+            quotes[code] = {
+                **self._base_quote("option_current_em", requested, received),
+                "last_price": row.get("最新价"), "volume": row.get("成交量"),
+                "amount": row.get("成交额"), "open_interest": row.get("持仓量"),
+                "provider_symbol": code,
+            }
         if fallback_missing:
             LOG.warning("SSE 补充未取得报价 contracts=%s missing_fields=bid/ask/last/volume/amount/open_interest/time",
                         fallback_missing)
-        for product_id, months in self.months.items():
+
+    def _fill_missing_cffex(self, contracts: dict[str, OptionContract], quotes: dict[str, dict[str, Any]]) -> None:
+        """The AKShare T-table (BBO, last, open interest; no volume/time) backs up P_OP_."""
+        missing = {code for code, c in contracts.items() if c.product.exchange == "CFFEX" and code not in quotes}
+        if not missing:
+            return
+        LOG.warning("CFFEX P_OP 未取得报价，改用 AKShare 表 contracts=%s", sorted(missing))
+        for month in sorted({code[:6].lower() for code in missing}):
             if self.should_stop():
                 break
-            _, spot_api = CFFEX_APIS[product_id]
-            for month in sorted(months):
-                answer = self._request(spot_api, symbol=month)
-                if answer is None:
-                    continue
-                frame, requested, received = answer
-                for row in self._rows(frame, spot_api):
-                    for label in ("看涨", "看跌"):
-                        raw_symbol = _code(row.get(f"{label}合约-标识"))
-                        code = raw_symbol.upper()
-                        if code not in contracts:
-                            continue
-                        quotes[code] = {
-                            **self._base_quote(spot_api, requested, received),
-                            "bid_price1": row.get(f"{label}合约-买价"),
-                            "bid_volume1": row.get(f"{label}合约-买量"),
-                            "ask_price1": row.get(f"{label}合约-卖价"),
-                            "ask_volume1": row.get(f"{label}合约-卖量"),
-                            "last_price": row.get(f"{label}合约-最新价"),
-                            "open_interest": row.get(f"{label}合约-持仓量"),
-                            "provider_symbol": raw_symbol,
-                        }
-        return quotes
+            _, spot_api = CFFEX_APIS[month[:2].upper()]
+            answer = self._request(spot_api, symbol=month)
+            if answer is None:
+                continue
+            frame, requested, received = answer
+            for row in self._rows(frame, spot_api):
+                for label in ("看涨", "看跌"):
+                    raw_symbol = _code(row.get(f"{label}合约-标识"))
+                    code = raw_symbol.upper()
+                    if code not in missing:
+                        continue
+                    quotes[code] = {
+                        **self._base_quote(spot_api, requested, received),
+                        "bid_price1": row.get(f"{label}合约-买价"),
+                        "bid_volume1": row.get(f"{label}合约-买量"),
+                        "ask_price1": row.get(f"{label}合约-卖价"),
+                        "ask_volume1": row.get(f"{label}合约-卖量"),
+                        "last_price": row.get(f"{label}合约-最新价"),
+                        "open_interest": row.get(f"{label}合约-持仓量"),
+                        "provider_symbol": raw_symbol,
+                    }
 
     def get_underlying_quotes(self) -> dict[str, dict[str, Any]]:
         quotes: dict[str, dict[str, Any]] = {}
-        by_symbol = {}
-        for product in self.products:
-            exchange, code = product.underlying_symbol.split(".", 1)
-            by_symbol[("sh" if exchange == "SSE" else "sz") + code] = product.underlying_symbol
-        for symbol, (fields, requested, received) in self.sina.fetch(list(by_symbol)).items():
-            raw = self.sina.underlying(fields, symbol, requested, received)
+        by_symbol = {sina_underlying_symbol(product): product.underlying_symbol for product in self.products}
+        for symbol, item in self.sina.fetch(list(by_symbol)).items():
+            raw = self.sina.underlying(item.fields, symbol, item.requested, item.received)
             if raw is None:
                 continue
             raw["quote_timestamp"] = _quote_datetime(raw["quote_timestamp"])
+            raw["batch_id"] = item.batch_id
             quotes[by_symbol[symbol]] = raw
         missing = set(by_symbol.values()) - quotes.keys()
         if missing and not self.should_stop():
@@ -541,6 +609,11 @@ class AKShareLive:
                     "last_price": row.get("trade"), "volume": row.get("volume"),
                     "open_interest": row.get("position"), "provider_symbol": symbol,
                 }
+        returned: dict[str, list[str]] = {}
+        for symbol in sorted(quotes):
+            returned.setdefault(symbol[:2], []).append(symbol)
+        # Keep the last known months for a product whose request failed this cycle.
+        self.future_symbols.update(returned)
         missing_products = wanted - {symbol[:2] for symbol in quotes}
         if missing_products and not self.should_stop():
             LOG.warning("期货品种未返回 products=%s", sorted(missing_products))

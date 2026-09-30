@@ -50,6 +50,10 @@ class TradingCalendar:
         if not self.start <= day <= self.end:
             raise CalendarError(f"交易日历仅覆盖 {self.start} 至 {self.end}，无法确认 {day}；请更新日历")
 
+    def is_trading_day(self, day: date) -> bool:
+        self.validate_day(day)
+        return day.weekday() < 5 and day not in self.closed
+
     def is_open(self, stamp: datetime) -> bool:
         local = stamp.astimezone(SHANGHAI)
         self.validate_day(local.date())
