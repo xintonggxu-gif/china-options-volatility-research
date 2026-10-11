@@ -462,10 +462,14 @@ class AKShareLive:
                 more, more_anchors = self.sina.fetch_bundled(anchors, missing, batch_size=20)
                 results.update(more)
                 anchor_rows += more_anchors
+            session_by_batch: dict[str, date] = {}
             for symbol, item in anchor_rows:
                 if symbol == underlying:
                     raw = self.sina.underlying(item.fields, symbol, item.requested, item.received)
                     target, key = chain.underlyings, product.underlying_symbol
+                    session = _date(item.fields[30]) if len(item.fields) > 30 else None
+                    if session is not None:
+                        session_by_batch[item.batch_id] = session
                 else:
                     raw = self.sina.future(item.fields, symbol, item.requested, item.received)
                     target, key = chain.futures, symbol.removeprefix("CFF_RE_")
@@ -489,10 +493,27 @@ class AKShareLive:
                     continue
                 raw["quote_timestamp"] = _quote_datetime(raw["quote_timestamp"])
                 raw["batch_id"] = item.batch_id
+                self._mark_untraded(raw, _date(item.fields[32]), session_by_batch.get(item.batch_id))
                 chain.options[code] = raw
         self._fill_missing_sse(contracts, chain.options)
         self._fill_missing_cffex(contracts, chain.options)
         return chain
+
+    @staticmethod
+    def _mark_untraded(raw: dict[str, Any], last_trade: date | None, session: date | None) -> None:
+        """A contract with no trade this session keeps Sina's record from its last trading day.
+
+        On CFFEX payloads the time, volume, turnover and price limits then belong to
+        that earlier day (checked against daily bars and limit widths on 2026-09-30
+        and 2026-10-09); the BBO is current. The session date comes from the
+        underlying in the same response. A last trade before it means no trade now.
+        """
+        if last_trade is None or session is None or last_trade >= session:
+            return
+        raw.update({
+            "session_date": session.isoformat(), "quote_timestamp": None,
+            "volume": 0, "amount": 0.0, "upper_limit": None, "lower_limit": None,
+        })
 
     def _fill_missing_sse(self, contracts: dict[str, OptionContract], quotes: dict[str, dict[str, Any]]) -> None:
         """Eastmoney remains a last-price-only fallback for missing SSE quotes."""

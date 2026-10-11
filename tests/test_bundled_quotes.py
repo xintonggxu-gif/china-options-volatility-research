@@ -26,6 +26,17 @@ PAYLOADS = {
 T0 = datetime(2026, 9, 30, 15, 5, tzinfo=SHANGHAI)
 
 
+def _untraded_payload() -> str:
+    """IO2610C4650 whose last trade was on 2026-09-28: Sina then repeats that day's record."""
+    fields = PAYLOADS["P_OP_io2610C4600"].split(",")
+    fields[7] = "4650"
+    fields[32] = "2026-09-28 15:00:00"
+    return ",".join(fields)
+
+
+PAYLOADS["P_OP_io2610C4650"] = _untraded_payload()
+
+
 class FakeCalls:
     """Stands in for BoundedCalls; answers from PAYLOADS and records each URL."""
 
@@ -171,6 +182,40 @@ def test_collector_writes_joinable_batches(tmp_path):
     io = next(row for row in options if row["product_id"] == "IO")
     assert (io["volume"], io["amount"]) == (2718, pytest.approx(978940.0))
     assert bundled[io["batch_id"]]["last_price"] == pytest.approx(4357.6155)
+
+
+def test_option_not_traded_this_session_is_dated_by_the_session(tmp_path):
+    from cn_option_data.collectors.live_collector import LiveCollector
+
+    calls = FakeCalls()
+    provider, by_id = _provider(calls, "IO")
+    contracts = {
+        "IO2610C4600": _contract(by_id["IO"], "IO2610C4600", "C", 4600.0),
+        "IO2610C4650": _contract(by_id["IO"], "IO2610C4650", "C", 4650.0),
+    }
+    try:
+        chain = provider.get_option_quotes(contracts)
+        stale, fresh = chain.options["IO2610C4650"], chain.options["IO2610C4600"]
+        assert stale["session_date"] == "2026-09-30"  # from sh000300 in the same response
+        assert (stale["volume"], stale["amount"], stale["upper_limit"], stale["lower_limit"]) == (0, 0.0, None, None)
+        assert stale["quote_timestamp"] is None and stale["bid_price1"] == "2.600"
+        assert "session_date" not in fresh and fresh["volume"] == "2718"
+
+        collector = LiveCollector(load_live_config(interval_seconds=60, project_root=tmp_path), [by_id["IO"]])
+        collector.active_options = contracts
+        provider.get_futures_quotes = lambda: {}
+        collector._collect(provider)
+        collector.writer.flush()
+    finally:
+        provider.close()
+    rows = {r["contract_code"]: r for r in
+            ds.dataset(tmp_path / "data" / "raw" / "option_quotes", format="parquet").to_table().to_pylist()}
+    assert rows["IO2610C4650"]["trade_date"] == "2026-09-30"
+    assert rows["IO2610C4650"]["quote_status"] == "NO_TRADE_THIS_SESSION"
+    assert rows["IO2610C4650"]["quote_timestamp"] is None
+    assert rows["IO2610C4650"]["source_quote_time"] == "2026-09-28 15:00:00"
+    assert rows["IO2610C4650"]["volume"] == 0
+    assert rows["IO2610C4600"]["quote_status"] == "TIME_SEMANTICS_UNVERIFIED"
 
 
 class FlakyDiscovery:

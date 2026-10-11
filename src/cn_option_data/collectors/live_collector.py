@@ -145,6 +145,9 @@ class LiveCollector:
             self.quality_issues[f"{table}:{product_id}:NO_VALID_VALUES"] += 1
             return "NO_VALID_VALUES"
         source_time, source_day, time_status = quote_clock(quote)
+        if quote.get("session_date"):
+            # The source time is the contract's last trade on an earlier day; the BBO is today's.
+            source_time, source_day, time_status = None, quote["session_date"], "NO_TRADE_THIS_SESSION"
         received: datetime = quote["received_timestamp"]
         flags: list[str] = []
         index_quote = table == "underlying_quotes" and self.by_product[product_id].option_category == "INDEX"
