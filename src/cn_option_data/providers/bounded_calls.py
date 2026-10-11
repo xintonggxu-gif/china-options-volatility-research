@@ -24,11 +24,27 @@ class CallCancelled(RuntimeError):
     pass
 
 
-def _worker(connection: Any, directory: str) -> None:
+class RequestBudgetExceeded(RuntimeError):
+    pass
+
+
+def _worker(connection: Any, directory: str, http_counter: Any = None, max_http_requests: int | None = None) -> None:
     # Terminal Ctrl+C goes to the collector. Parent terminates this process explicitly.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     import requests
+
+    if http_counter is not None:
+        original_request = requests.sessions.Session.request
+
+        def counted_request(session: Any, method: str, url: str, **kwargs: Any) -> Any:
+            with http_counter.get_lock():
+                if http_counter.value >= max_http_requests:
+                    raise RequestBudgetExceeded("HTTP request budget exhausted")
+                http_counter.value += 1
+            return original_request(session, method, url, **kwargs)
+
+        requests.sessions.Session.request = counted_request
 
     session = requests.Session()
     ak = None
@@ -77,10 +93,15 @@ class BoundedCalls:
     """
 
     def __init__(self, *, timeout: float = 15.0, should_stop: Callable[[], bool] = lambda: False,
-                 on_wait: Callable[[], None] = lambda: None):
+                 on_wait: Callable[[], None] = lambda: None, max_http_requests: int | None = None):
+        if max_http_requests is not None and max_http_requests <= 0:
+            raise ValueError("max_http_requests must be positive")
         self.timeout = timeout
         self.should_stop = should_stop
         self.on_wait = on_wait
+        self.max_http_requests = max_http_requests
+        self._context = mp.get_context("spawn")
+        self._http_counter = self._context.Value("i", 0) if max_http_requests is not None else None
         self._directory = tempfile.TemporaryDirectory(prefix="cn-option-http-")
         self._process: Any = None
         self._connection: Any = None
@@ -89,9 +110,12 @@ class BoundedCalls:
         if self._process is not None and self._process.is_alive():
             return
         self._terminate()
-        context = mp.get_context("spawn")
-        parent, child = context.Pipe()
-        process = context.Process(target=_worker, args=(child, self._directory.name), daemon=True)
+        parent, child = self._context.Pipe()
+        process = self._context.Process(
+            target=_worker,
+            args=(child, self._directory.name, self._http_counter, self.max_http_requests),
+            daemon=True,
+        )
         try:
             process.start()
         except BaseException:
@@ -165,3 +189,7 @@ class BoundedCalls:
     def close(self) -> None:
         self._terminate()
         self._directory.cleanup()
+
+    @property
+    def http_requests(self) -> int:
+        return self._http_counter.value if self._http_counter is not None else 0

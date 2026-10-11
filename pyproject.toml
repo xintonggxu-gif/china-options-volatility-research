@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cn-option-data"
 version = "0.4.0"
-description = "Registry-driven live quotes for Chinese ETF and index option chains"
+description = "Live quotes and conservative daily history for Chinese ETF and index option chains"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "akshare>=1.18.97,<2",
+  "pandas>=2,<4",
   "pyarrow>=20,<24",
   "requests>=2.31,<3",
 ]

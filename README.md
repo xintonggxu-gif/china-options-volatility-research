@@ -46,7 +46,7 @@ ETF underlyings and the indexes associated with HO/IO/MO are requested from Sina
 
 ## Parquet Storage and Timestamps
 
-The program saves only these five Parquet tables:
+The live collector saves these five Parquet tables:
 
 ```text
 data/raw/contract_snapshots/
@@ -80,7 +80,52 @@ The `hour` partition remains a receipt-hour bucket. Do not combine it with `trad
 
 Option `quote_status` can contain `BBO_NOT_AVAILABLE`, `CROSSED_BBO`, `SOURCE_TIME_DATE_ONLY`, `SOURCE_TIME_UNKNOWN`, and `TIME_SEMANTICS_UNVERIFIED`. Concurrent issues are joined with `|` in this order: BBO condition, time precision, then time semantics. A complete-looking timestamp is not proof of its meaning. There is insufficient evidence that Sina option field 32, underlying date/time fields, or futures `tradedate`/`ticktime` strictly represent the corresponding BBO update time or one synchronized snapshot instant. Missing BBO on an index is not treated as an ETF quote failure.
 
-The collector saves raw observations that pass the existing value checks. It does not scan earlier Parquet files, remove consecutive identical quotes, or discard late records based on the latest previously seen timestamp. Do not use quotes with uncertain timing directly for strict intraday matching. This project does not calculate IV, Greeks, volatility surfaces, PnL, or historical backfills.
+The live collector saves raw observations that pass the existing value checks. It does not scan earlier Parquet files, remove consecutive identical quotes, or discard late records based on the latest previously seen timestamp. Do not use quotes with uncertain timing directly for strict intraday matching. This project does not calculate IV, Greeks, volatility surfaces, or PnL.
+
+## Historical Daily Market Data From 2015
+
+`backfill-daily` now discovers dated contracts from exchange records. It never needs local live `contract_snapshots` to discover an old contract. Start at 2015-02-09 for the first listed chain, 510050. Other products are skipped before their actual listing dates in `config/product_registry.csv`. This is a separate path; `collect-live` and its five tables are unchanged.
+
+The steps for each selected trading day are:
+
+1. Read the historical trading calendar and skip dates before each product's listing.
+2. Discover SSE contracts from its dated option risk report and carry exact terms forward from SSE listing/adjustment records. For SZSE, join its dated risk report with historical listing, delisting, and adjustment files. For CFFEX, read its dated official daily CSV, which itself identifies all option and futures month contracts present that day.
+3. Get raw unadjusted ETF daily OHLC from Tencent via AKShare `stock_zh_a_hist_tx(adjust="")`, or index OHLC from AKShare `stock_zh_index_daily`. Request Sina per-contract option daily OHLC for SSE/SZSE; get CFFEX options and IH/IF/IC/IM futures OHLC and settlement from the official CSV.
+4. Write separate Parquet tables with the source, source interface, provider symbol, source trading day, local request/receipt times, and missing-field reason. Generate a per-product/day coverage report. Missing exchange rows and missing option prices stay missing.
+
+The same Sina endpoint used by AKShare `option_sse_daily_sina` is called directly for SSE and SZSE option codes. This makes its historical `null` response distinguishable from a network failure. A successful per-contract response contains multiple dates and is cached under `data/metadata/backfill_price_cache/`, so later days and restarted runs can reuse it without another HTTP call. Some old SZSE contracts returned `null` or began reporting only after their actual listing: a historical roster does **not** guarantee historical prices. Clearly absent contract/date prices are recorded in `data/metadata/backfill_absences.json` and skipped on restart; `--retry-absent-prices` explicitly checks them again. Temporary network errors and request limits are never cached as source absence.
+
+Example, first preview with no HTTP calls, then execute a small bounded slice:
+
+```bash
+python -m cn_option_data.cli backfill-daily --products 510050 --start-date 2015-02-09 --end-date 2015-02-09 --dry-run --max-requests 20
+python -m cn_option_data.cli backfill-daily --products 510050 --start-date 2015-02-09 --end-date 2015-02-09 --execute --max-requests 20
+```
+
+The default is preview; dates are mandatory. `--max-requests` caps underlying Requests HTTP calls, including calls made inside AKShare. The default cap is 20, so a complete year needs many explicit resumed runs or a deliberately larger cap. Each outer call has a 15-second deadline, calls are spaced by at least 0.5 seconds, and a failure is retried once within the cap. `Ctrl+C` and `SIGTERM` stop new calls, flush completed Parquet rows and save the report. Repeating the command resumes from persisted business keys; new parts use UUID filenames and atomic replacement. Check the report's `option_coverage_of_exchange_roster`, `option_missing_examples`, and per-category statuses before extending the range.
+
+Outputs are under `data/historical/roster_daily/`, `option_daily/`, `underlying_daily/`, `futures_daily/`, `contract_terms_daily/`, and `contract_adjustments/`, partitioned by trade date and exchange. Reports are under `data/metadata/backfill_runs/`. `--output-root DIR` writes a sample to a separate directory. Daily OHLC/settlement are **not** historical bid/ask; they must never be written into live BBO columns. Zero or absent source close remains raw with a quality reason and cannot be used directly for IV. No IV, Greeks, or PnL is calculated here.
+
+### Repair historical terms and inspect price quality
+
+Some earlier SSE runs saved a day's roster and prices but missed that day's contract terms. The historical collector now checks terms even when the roster is already saved. `--repair-sse-terms` requests only the dated SSE roster/listing/adjustment information needed to fill missing `contract_terms_daily` rows; it does not request option or underlying prices and does not alter the live collector. Choose SSE products only. Start from the last **continuous** day with complete terms and proceed in date order: a listing or adjustment that occurred during an unprocessed gap cannot be reconstructed by querying only a later day. Preview first, then repeat bounded runs until the report no longer says `REQUEST_LIMIT`:
+
+```bash
+python -m cn_option_data.cli backfill-daily --products 510050 --start-date 2024-03-01 --end-date 2025-01-02 --repair-sse-terms --dry-run --max-requests 50
+python -m cn_option_data.cli backfill-daily --products 510050 --start-date 2024-03-01 --end-date 2025-01-02 --repair-sse-terms --execute --max-requests 50
+```
+
+The dates above illustrate a gap; inspect your own coverage report to choose its actual start. The repair appends verified term rows only. An old `option_daily` row with a null expiry remains unchanged; later research must join `option_daily` to `contract_terms_daily` by trade date, product, and contract code. If the exchange records or exact code/version cannot verify a term, the run reports `SOURCE_UNAVAILABLE` or `REQUEST_LIMIT` instead of inventing a value.
+
+Audit already saved data without making network requests or changing raw Parquet:
+
+```bash
+python -m cn_option_data.collectors.historical_quality --products 510050 --start-date 2025-01-02 --end-date 2025-01-02
+```
+
+The audit reports missing or conflicting terms, a null or nonpositive close, OHLC inconsistencies, missing same-day underlying, and dates whose expiry is still unresolved after joining verified terms. It examines dates with saved files; use `backfill_runs/` to identify dates with no saved data. New daily price rows carry OHLC quality reasons in `missing_reason`; old rows remain raw and are assessed by the audit. Neither source close nor settlement is historical bid/ask.
+
+Current gaps are explicit: CFFEX's verified daily CSV does not supply exact option expiry/last trading dates or contract multipliers, so its option `contract_terms_daily` remains unavailable. Historical interest rates and ETF cash-dividend sources have not been verified, so `rates_daily/` and `etf_dividends/` remain empty. These are prerequisites for a reliable full daily IV surface. SSE/SZSE dated exchange rosters and terms were checked on a few launch/older days, but complete multi-year coverage is not yet proven; inspect every run's coverage report. HO's registry start was corrected to 2022-12-19 using the [CFFEX listing notice](https://www.cffex.com.cn/cn/jystz/20221214/30918.html).
 
 ## Network Protection, Futures Scope, and Shutdown
 

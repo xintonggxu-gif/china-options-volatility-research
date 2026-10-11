@@ -8,6 +8,6 @@ product_id,exchange,option_category,underlying_code,underlying_type,hedge_future
 159922,SZSE,ETF,159922,ETF,IC,2022-09-19,ACTIVE,,10000 underlying ETF units per standard contract; adjusted contracts follow exchange notices,CNY 0.0001 per ETF unit,EUROPEAN,PHYSICAL,1.0,2022-09-19,SZSE.159922
 159915,SZSE,ETF,159915,ETF,,2022-09-19,ACTIVE,,10000 underlying ETF units per standard contract; adjusted contracts follow exchange notices,CNY 0.0001 per ETF unit,EUROPEAN,PHYSICAL,1.0,2022-09-19,SZSE.159915
 159901,SZSE,ETF,159901,ETF,,2022-12-12,ACTIVE,,10000 underlying ETF units per standard contract; adjusted contracts follow exchange notices,CNY 0.0001 per ETF unit,EUROPEAN,PHYSICAL,1.0,2022-12-12,SZSE.159901
-HO,CFFEX,INDEX,000016.SH,EQUITY_INDEX,IH,2023-12-18,ACTIVE,,CNY 100 per index point,0.2 index points,EUROPEAN,CASH,1.0,2023-12-18,SSE.000016
+HO,CFFEX,INDEX,000016.SH,EQUITY_INDEX,IH,2022-12-19,ACTIVE,,CNY 100 per index point,0.2 index points,EUROPEAN,CASH,1.0,2022-12-19,SSE.000016
 IO,CFFEX,INDEX,000300.SH,EQUITY_INDEX,IF,2019-12-23,ACTIVE,,CNY 100 per index point,0.2 index points,EUROPEAN,CASH,1.0,2019-12-23,SSE.000300
 MO,CFFEX,INDEX,000852.SH,EQUITY_INDEX,IM,2022-07-22,ACTIVE,,CNY 100 per index point,0.2 index points,EUROPEAN,CASH,1.0,2022-07-22,SSE.000852
